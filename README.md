@@ -1,8 +1,8 @@
-# UDFS
-Implementation of "UDFS: Lightweight Representation-Driven Robust Network Traffic Classification"
+# BFVS
+Implementation of "BFVS: Efficient Flow Volume Representation and Unknown Traffic Synthesis for Open-World Encrypted Traffic Analysis"
 
 
-This repository provides the code and dataset of UDFS for encrypted traffic analysis. It includes the implementation of the **Up-Down Flow Sequence (UDFS)** representation, which compresses traffic traces into discriminative flow-level sequences, as well as an adaptive threshold mechanism for enhancing class-specific discriminability. The repository also contains scripts for training and evaluation on both coarse-grained and fine-grained datasets, supporting experiments under concept drift and open-world scenarios.
+This repository provides the code and dataset of BFVS for encrypted traffic analysis. It includes the implementation of the **Bidirectional Flow Volume Sequence (BFVS)** representation, which compresses traffic traces into discriminative flow-level sequences, as well as an open-world recognition mechanism based on cross-class semantic perturbation. The repository also contains scripts for training and evaluation on both coarse-grained and fine-grained datasets, supporting experiments under concept drift and open-world scenarios.
 
 ![overview](overview.png)
 
@@ -54,41 +54,104 @@ An example of the DataFrame structure:
 |  2 |       7 | [[2502, 123775], [11004, 768523], [1893, 5857], [1861, 5857], [1893, 5857], [1829, 5857], [1861, 5857], [2019, 4398]]                                                                                                                                 |
 -----
 
-### How to Use
+## How to Use
 
-#### Step 1: Configure the Project
+### Step 1: Build the Dataset
 
-Before running the script, open `main.py` and configure the paths and hyperparameters in the **Configuration** section at the top of the file.
+First, construct the BFVS traffic dataset using `build_dataset.py`.
 
-  - **Dataset Paths:** Set `TRAIN_PKL` and `TEST_PKL` to point to your training and testing `.pkl` files.
-  - **Output Directory:** Specify the `SAVE_DIR` where all model artifacts and results will be saved.
-  - **Model & Training Hyperparameters:** Adjust parameters like `LR`, `EPOCHS`, `BATCH_SIZE`, `D_MODEL`, etc., as needed for your specific dataset.
+```bash
+python build_dataset.py
+```
 
-#### Step 2: Train The Model and Evaluate
+The generated dataset will be saved as `.pkl` files containing:
 
-The script handles training, evaluation, and visualization in a single run. Execute the main script from your terminal:
+* `features`: BFVS sequence features
+* `label`: traffic category labels
+
+Example dataset formats can be found in the `datasets/` directory.
+
+---
+
+### Step 2: Generate Pseudo-Unknown Samples
+
+After constructing the original dataset, generate pseudo-unknown traffic samples using `build_fake_dataset.py`.
+
+```bash
+python build_fake_dataset.py
+```
+
+This script synthesizes pseudo-unknown samples through cross-class semantic perturbation by adaptively replacing heterogeneous local Flow segments. The generated dataset will be used as the additional unknown category during open-world training.
+
+---
+
+### Step 3: Configure Training Parameters
+
+Open `main.py` and configure the dataset paths and hyperparameters.
+
+#### Dataset Paths
+
+* `TRAIN_PKL`: known-class training dataset
+* `NEGATIVE_TRAIN_PKL`: synthesized pseudo-unknown dataset
+* `TEST_PKL`: testing dataset
+* `WORLD_PKL`: additional unknown dataset for open-world evaluation (optional)
+
+#### Output Directory
+
+* `SAVE_DIR`: directory for saving checkpoints and evaluation results
+
+#### Training Hyperparameters
+
+Important hyperparameters include:
+
+* `LR`: learning rate
+* `EPOCHS`: number of training epochs
+* `BATCH_SIZE`: batch size
+* `D_MODEL`: Transformer hidden dimension
+* `N_HEAD`: number of attention heads
+* `N_LAYERS`: number of Transformer encoder layers
+
+---
+
+### Step 4: Train and Evaluate the Model
+
+Run the following command:
 
 ```bash
 python main.py
 ```
 
-This command will perform the following actions:
+The script automatically performs:
 
-1.  Load the training and testing data.
-2.  Train the Flow Transformer model using the Adaptive Prototypical Loss.
-3.  Calculate and save global class prototypes.
-4.  Compute and save dynamic, class-specific thresholds for open-set recognition.
-5.  Evaluate the model's performance on both **closed-set** and **open-set** tasks.
-6.  Generate and save a t-SNE visualization of the feature space.
+1. BFVS feature loading and preprocessing
+2. Construction of the augmented ((N+1))-class training set
+3. Transformer model training
+4. Closed-set evaluation
+5. Open-set evaluation
+6. Unknown traffic detection analysis
+7. Latency profiling
 
-#### Step 3: Analyze the Outputs
+---
 
-After the script finishes, all artifacts will be saved in the directory specified by `SAVE_DIR`. The key output files include:
+### Step 5: Analyze the Outputs
 
-  - `flow_transformer.pt`: The trained model weights.
-  - `label_encoder.pkl`: The label encoder mapping class names to integer indices.
-  - `prototypes.pt`: The computed feature prototype for each known class.
-  - `dynamic_thresholds.pt`: The learned distance threshold for each known class, used for identifying unknown traffic.
-  - `tsne_visualization_dynamic_threshold.png`: The t-SNE plot visualizing the learned feature embeddings for the training and testing data.
+All outputs will be saved in the directory specified by `SAVE_DIR`.
 
-The console output will provide detailed classification reports and performance metrics (Accuracy, Precision, Recall, F1-score) for both closed-set and open-set scenarios.
+Key output files include:
+
+* `model.pt`
+  Trained model checkpoint
+
+* `label_encoder.pkl`
+  Label encoder for known classes
+
+The console output additionally reports:
+
+* Closed-set metrics
+* Open-set metrics
+* AUROC
+* Unknown traffic detection performance
+* Detailed classification reports
+* Training and inference latency statistics
+
+These results can be used to evaluate the effectiveness, robustness, and generalization capability of the proposed framework under both concept drift and open-world scenarios.

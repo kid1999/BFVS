@@ -1,25 +1,21 @@
+import math
 import os
 import pickle
 import random
+from typing import List
+from sklearn.metrics import roc_auc_score
 import numpy as np
 import pandas as pd
-from typing import Tuple, List, Dict
-import math
 import torch
-import torch.nn.functional as F
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from sklearn.model_selection import train_test_split 
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score, roc_curve
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from sklearn.metrics import classification_report, confusion_matrix
-
+from torch import nn
+from torch.nn.utils.rnn import pad_sequence
 from torch.optim import lr_scheduler
-
-from sklearn.manifold import TSNE
-import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import time
 
 # =========================
 # 0. Set Random Seed
@@ -33,29 +29,30 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 set_seed(42)
 
-# =========================
-# 1. Configuration
-# =========================
-TRAIN_PKL = "../datasets/github10_20250303.pkl"
-TEST_PKL  = "../datasets/github100.pkl"
+
+# 已知类别的训练集
+TRAIN_PKL = "/data/wf/bfvs/data/github10_20250303.pkl"
+# 合成的负样本数据集 (用于作为 N+1 类进行训练) - 请修改此路径
+NEGATIVE_TRAIN_PKL = "/data/wf/bfvs/data/github10_20250303_fake.pkl"
+# 测试集 (包含已知和未知)
+TEST_PKL = "/data/wf/bfvs/data/github10_20250502.pkl"
+# 额外的测试用未知样本 (可选)
+WORLD_PKL = "/data/wf/bfvs/data/github100_raw.pkl" 
 
 # --- Log and Model Output ---
-SAVE_DIR = "./output"
+SAVE_DIR = "/data/wf/bfvs/output/github10_20250303"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# File Path Configuration
+MODEL_PATH = os.path.join(SAVE_DIR, "model.pt")
 LABEL_ENCODER_PATH = os.path.join(SAVE_DIR, "label_encoder.pkl")
-MODEL_PATH         = os.path.join(SAVE_DIR, "flow_transformer.pt")
-PROTOTYPES_PATH    = os.path.join(SAVE_DIR, "prototypes.pt")
-CONFUSION_WEIGHTS_PATH = os.path.join(SAVE_DIR, "confusion_weights.pt")
-THRESHOLDS_PATH    = os.path.join(SAVE_DIR, "dynamic_thresholds.pt") # Save dynamic thresholds
 
 # Training Hyperparameters
-LR          = 1e-4
-EPOCHS      = 2000  # 500 when train baidu20(easy) dataset
-BATCH_SIZE  = 64
+LR = 1e-4
+EPOCHS = 300
+BATCH_SIZE = 64
 
 # Transformer Model Hyperparameters
 D_MODEL = 256
@@ -64,22 +61,16 @@ N_LAYERS = 4
 DIM_FEEDFORWARD = 1024
 DROPOUT = 0.1
 
-# --- Dynamic Threshold Hyperparameters ---
-THRESHOLD_PERCENTILE = 99   # Percentile for calculating the base threshold
-TOP_K_NEIGHBORS = 5         # Number of nearest neighbors to consider for inter-class distance
-THRESHOLD_SCALE = 0.1       # Maximum scaling factor for dynamic threshold adjustment (e.g., 0.1 means the threshold can be scaled down by at most 10%)
-
-
-# t-SNE Visualization Hyperparameters
-TSNE_MAX_SAMPLES = 1000
-TSNE_PERPLEXITY = 40
 
 # =========================
 # 2. Data Loading and Preprocessing
 # =========================
 def log_normalize(seq):
     arr = np.array(seq, dtype=np.float32)
-    return torch.tensor(np.log1p(arr), dtype=torch.float32)
+    # 保持符号的 log 归一化
+    arr = np.sign(arr) * np.log1p(np.abs(arr))
+    return torch.tensor(arr, dtype=torch.float32)
+
 
 def collate_fn(batch):
     sequences, labels = zip(*batch)
@@ -88,12 +79,29 @@ def collate_fn(batch):
     labels = torch.tensor(labels, dtype=torch.long)
     return padded_seqs, lengths, labels
 
+
 class FlowDataset(Dataset):
-    def __init__(self, X: List[torch.Tensor], y: List[str], le: LabelEncoder, known_class: List[str]):
+    def __init__(self, X: List[torch.Tensor], y: List[str], le: LabelEncoder, known_class_set: set):
+        """
+        N+1 策略的核心 Dataset
+        """
         self.X = X
         self.le = le
-        self.known_class = set(known_class)
-        y_mapped = [le.transform([l])[0] if l in self.known_class else -1 for l in y]
+        self.known_class_set = known_class_set
+
+        # 定义未知类别的索引 = 已知类别数量
+        # 例如已知 0..49 (共50类), 则未知类索引为 50
+        self.unknown_index = len(self.le.classes_)
+
+        y_mapped = []
+        for l in y:
+            if l in self.known_class_set:
+                # 已知样本：正常编码 (0 ~ N-1)
+                y_mapped.append(le.transform([l])[0])
+            else:
+                # 未知/负样本：映射为 N
+                y_mapped.append(self.unknown_index)
+
         self.y = torch.tensor(y_mapped, dtype=torch.long)
 
     def __len__(self):
@@ -105,8 +113,9 @@ class FlowDataset(Dataset):
             x = torch.stack([x, torch.zeros_like(x)], dim=-1)
         return x, self.y[idx]
 
+
 # =========================
-# 3. Transformer Model and Adaptive Loss
+# 3. Transformer Model (N+1 Softmax)
 # =========================
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
@@ -123,8 +132,9 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:x.size(1), :]
         return self.dropout(x)
 
+
 class FlowTransformer(nn.Module):
-    def __init__(self, input_dim, d_model, n_head, n_layers, dim_feedforward, dropout):
+    def __init__(self, input_dim, d_model, n_head, n_layers, dim_feedforward, dropout, num_classes):
         super().__init__()
         self.d_model = d_model
         self.input_proj = nn.Linear(input_dim, d_model)
@@ -134,382 +144,386 @@ class FlowTransformer(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.layer_norm = nn.LayerNorm(d_model)
 
+        # === 修改点：增加分类头 ===
+        # 输出维度为 num_classes (这里传入的值已经是 N+1)
+        self.classifier = nn.Linear(d_model, num_classes)
+
     def forward(self, x, lengths):
         batch_size, seq_len, _ = x.shape
         x = self.input_proj(x)
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
         x = torch.cat([cls_tokens, x], dim=1)
+
         cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
         seq_mask = torch.arange(seq_len, device=x.device)[None, :] >= lengths[:, None]
         src_key_padding_mask = torch.cat([cls_mask, seq_mask], dim=1)
+
         x = self.pos_encoder(x)
         output = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
         cls_output = output[:, 0, :]
         final_feature = self.layer_norm(cls_output)
-        return final_feature
 
-class AdaptivePrototypicalLoss(nn.Module):
-    def __init__(self, num_classes: int):
-        super(AdaptivePrototypicalLoss, self).__init__()
-        self.num_classes = num_classes
-        self.register_buffer('class_weights', torch.ones(num_classes))
-
-    def forward(self, features, labels):
-        classes = torch.unique(labels)
-        # Handle case where a batch might not have enough classes to form prototypes
-        if len(features) == 0 or len(classes) == 0:
-            return torch.tensor(0.0, device=features.device, requires_grad=True)
-            
-        prototypes = torch.stack([features[labels == c].mean(dim=0) for c in classes])
-        dists = torch.cdist(features, prototypes)
-        logits = -dists
-        
-        map_labels = torch.zeros_like(labels)
-        for i, c in enumerate(classes):
-            map_labels[labels == c] = i
-            
-        batch_weights = self.class_weights[classes]
-        criterion = nn.CrossEntropyLoss(weight=batch_weights)
-        loss = criterion(logits, map_labels)
-        return loss
-
-    @torch.no_grad()
-    def update_weights(self, all_features: torch.Tensor, all_labels: torch.Tensor):
-        print("\nUpdating adaptive loss weights based on class confusion...")
-        device = all_features.device
-        
-        # Ensure there are features to process
-        if len(all_features) == 0:
-            print("No features to update weights.")
-            return
-
-        prototypes = torch.stack([all_features[all_labels == c].mean(dim=0) for c in range(self.num_classes)])
-        confusion_scores = torch.zeros(self.num_classes, device=device)
-        proto_dists = torch.cdist(prototypes, prototypes)
-        
-        for c in range(self.num_classes):
-            features_c = all_features[all_labels == c]
-            if len(features_c) == 0: continue
-            
-            intra_dist = torch.cdist(features_c, prototypes[c].unsqueeze(0)).mean()
-            inter_dists_c = proto_dists[c].clone()
-            inter_dists_c[c] = float('inf')
-            
-            if torch.isinf(inter_dists_c).all(): # Handle case with only one class
-                min_inter_dist = 1.0
-            else:
-                min_inter_dist = inter_dists_c.min()
-
-            confusion_scores[c] = intra_dist / (min_inter_dist + 1e-8)
-            
-        new_weights = F.softmax(confusion_scores, dim=0) * self.num_classes
-        self.class_weights = 0.5 * self.class_weights + 0.5 * new_weights
-        # print("Updated Class Weights (Confusion-based):")
-        # weights_np = self.class_weights.cpu().numpy()
-        # for i, w in enumerate(weights_np):
-        #     print(f"  Class {i}: {w:.4f}")
-
-# =========================
-# 4. Helper Functions
-# =========================
-def extract_features_global(model: nn.Module, dataloader: DataLoader, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Extracts features for the entire dataset."""
-    model.eval()
-    all_features, all_labels = [], []
-    with torch.no_grad():
-        for X_batch, lengths, y_batch in dataloader:
-            features = model(X_batch.to(device), lengths.to(device))
-            all_features.append(features.cpu())
-            all_labels.append(y_batch)
-    return torch.cat(all_features), torch.cat(all_labels)
+        # === 修改点：直接返回 Logits ===
+        logits = self.classifier(final_feature)
+        return logits
 
 
 # =========================
-# 5. Training and Evaluation Function
+# 4. Training and Evaluation Function
 # =========================
-def train_eval_model(train_loader, test_loader, num_classes, le: LabelEncoder, device: torch.device):
+def train_eval_n_plus_1(train_loader, test_loader, num_known_classes, le, device):
+    # 总类别数 = 已知类数量 + 1 (Unknown类)
+    total_classes = num_known_classes + 1
+
     model = FlowTransformer(
         input_dim=2, d_model=D_MODEL, n_head=N_HEAD, n_layers=N_LAYERS,
-        dim_feedforward=DIM_FEEDFORWARD, dropout=DROPOUT
+        dim_feedforward=DIM_FEEDFORWARD, dropout=DROPOUT,
+        num_classes=total_classes
     ).to(device)
-    
-    criterion = AdaptivePrototypicalLoss(num_classes=num_classes).to(device)
+
+    # 使用标准交叉熵，将Unknown视为普通的一个类别
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
+    print(
+        f"\nModel initialized for {total_classes} classes (0-{num_known_classes - 1}: Known, {num_known_classes}: Unknown)")
+    
+    # --- 训练阶段耗时统计初始化 ---
+    train_start_time = time.perf_counter()
+    total_train_samples_processed = 0
 
     # -------- Training --------
     for epoch in range(EPOCHS):
         model.train()
         total_loss, n_samples = 0.0, 0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}")
+
         for X_batch, lengths, y_batch in pbar:
             X_batch, lengths, y_batch = X_batch.to(device), lengths.to(device), y_batch.to(device)
-            mask = y_batch >= 0
-            if mask.sum() < 2 or len(torch.unique(y_batch[mask])) < 2: continue # Need at least 2 samples from 2 classes
-            
+
             optimizer.zero_grad()
-            features = model(X_batch[mask], lengths[mask])
-            loss = criterion(features, y_batch[mask])
+            logits = model(X_batch, lengths)
+            loss = criterion(logits, y_batch)
             loss.backward()
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
-            total_loss += loss.item() * mask.sum().item()
-            n_samples += mask.sum().item()
+            total_train_samples_processed += len(y_batch) # 累加所有 epoch 的样本总数
+
+            total_loss += loss.item() * len(y_batch)
+            n_samples += len(y_batch)
             pbar.set_postfix(loss=f"{loss.item():.4f}")
-            
+
         scheduler.step()
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"[Epoch {epoch+1}/{EPOCHS}] Avg Loss={total_loss/max(1,n_samples):.6f} | lr={current_lr:.6f}")
+        print(f"[Epoch {epoch + 1}/{EPOCHS}] Avg Loss={total_loss / max(1, n_samples):.6f}")
         
-        if (epoch + 1) % 1 == 0:
-            train_features_for_weights, train_labels_for_weights = extract_features_global(model, train_loader, device)
-            known_mask_weights = train_labels_for_weights != -1
-            criterion.update_weights(train_features_for_weights[known_mask_weights].to(device), train_labels_for_weights[known_mask_weights].to(device))
+    # --- 结束训练计时 ---
+    train_end_time = time.perf_counter()
+    total_train_duration = train_end_time - train_start_time
+    avg_train_time_per_sample = total_train_duration / max(1, total_train_samples_processed)
 
+    # 保存模型
     torch.save(model.state_dict(), MODEL_PATH)
-    final_weights = criterion.class_weights.cpu()
-    torch.save(final_weights, CONFUSION_WEIGHTS_PATH)
-    print(f"Final confusion-based weights saved to {CONFUSION_WEIGHTS_PATH}")
-
-    # --- Calculate Resources for Evaluation (Core: Dynamic Thresholds) ---
-    print("\nCalculating resources for evaluation with DYNAMIC thresholds...")
-    train_features, train_labels = extract_features_global(model, train_loader, device)
-    known_mask = train_labels != -1
-    train_features, train_labels = train_features[known_mask], train_labels[known_mask]
+    print(f"Model saved to {MODEL_PATH}")
     
-    # 1. Calculate Global Prototypes
-    global_prototypes = torch.stack([train_features[train_labels == c].mean(dim=0) for c in range(num_classes)])
-    torch.save(global_prototypes, PROTOTYPES_PATH)
-    print(f"Global prototypes saved to {PROTOTYPES_PATH}")
+    def per_label_f1_dict(y_true, y_pred, labels=None, zero_division=0):
+        # 所有原始 label 名 + Unknown
+        target_names = list(le.classes_) + ["Unknown"]
 
-    # 2. Calculate a 'difficulty score' S_c for each class
-    print(f"\nCalculating class-specific difficulty scores (Top-{TOP_K_NEIGHBORS} neighbors)...")
-    intra_dists = torch.zeros(num_classes)
-    inter_dists = torch.zeros(num_classes)
+        # 确定需要计算 F1 的标签集
+        labels = np.unique(np.concatenate([y_true, y_pred]))
+
+        # 计算 F1
+        f1s = f1_score(
+            y_true,
+            y_pred,
+            labels=labels,
+            average=None,
+            zero_division=zero_division
+        )
+
+        # 将整数标签解码为原始类别名
+        label_names = []
+        for l in labels:
+            if l < len(le.classes_):
+                label_names.append(le.inverse_transform([l])[0])
+            else:
+                label_names.append("Unknown")
+
+        return dict(zip(label_names, f1s))
+
+    # -------- Evaluation --------
+    # --- 推理阶段耗时统计初始化 ---
+    infer_start_time = time.perf_counter()
+    total_infer_samples_processed = 0
     
-    proto_dists_matrix = torch.cdist(global_prototypes, global_prototypes) # Calculate distances between all prototypes
-
-    for c in range(num_classes):
-        # a. Calculate intra-class spread (Intra_c): Average distance from samples of class c to their prototype.
-        features_c = train_features[train_labels == c]
-        if len(features_c) > 0:
-            intra_dists[c] = torch.cdist(features_c, global_prototypes[c].unsqueeze(0)).mean()
-        
-        # b. Calculate inter-class proximity (Inter_c): Average distance from class c's prototype to the Top-K nearest prototypes of other classes.
-        # Sort and take the 1st to K+1th elements (the 0th is the prototype itself, with distance 0)
-        if num_classes > TOP_K_NEIGHBORS:
-            k_nearest_dists = torch.topk(proto_dists_matrix[c], k=TOP_K_NEIGHBORS + 1, largest=False).values[1:]
-        else: # Handle case with fewer classes than K
-            k_nearest_dists = torch.topk(proto_dists_matrix[c], k=num_classes, largest=False).values[1:]
-
-        inter_dists[c] = k_nearest_dists.mean() if len(k_nearest_dists) > 0 else 1e9
-
-    # c. Final score S_c = Intra_c / Inter_c. A higher score means the class is more spread out internally and closer to its neighbors, making it harder to distinguish.
-    difficulty_scores = intra_dists / (inter_dists + 1e-8)
-    print("Difficulty Scores (Intra/Inter):")
-    for i, s in enumerate(difficulty_scores):
-        print(f"  Class {i} ({le.inverse_transform([i])[0]}): {s:.4f}")
-
-    # 3. Calculate Base Thresholds (using percentiles)
-    base_thresholds = torch.zeros(num_classes)
-    for c in range(num_classes):
-        features_c = train_features[train_labels == c]
-        if len(features_c) > 0:
-            dists_c = torch.cdist(features_c, global_prototypes[c].unsqueeze(0)).squeeze()
-            base_thresholds[c] = torch.quantile(dists_c, THRESHOLD_PERCENTILE / 100.0)
-        else:
-            base_thresholds[c] = float('inf')
-
-    # 4. Calculate Dynamic Adjustment Factors (gamma_c) based on difficulty scores
-    # Goal: The higher the score S_c (more difficult), the smaller the adjustment factor, which tightens (lowers) the threshold to be more strict.
-    # Normalize scores using z-score, then use the tanh function to smoothly map them to adjustment factors.
-    if difficulty_scores.std() > 0:
-        normalized_scores = (difficulty_scores - difficulty_scores.mean()) / difficulty_scores.std()
-    else:
-        normalized_scores = torch.zeros_like(difficulty_scores)
-    
-    adjustment_factors = 1.0 - THRESHOLD_SCALE * torch.tanh(normalized_scores)
-
-    # 5. Calculate and Save Final Dynamic Thresholds
-    final_thresholds = base_thresholds * adjustment_factors
-    torch.save(final_thresholds, THRESHOLDS_PATH)
-
-    print("\nFinal Personalized & Dynamic Thresholds:")
-    for i, t in enumerate(final_thresholds):
-        print(f"  Class {i} ({le.inverse_transform([i])[0]}): {t:.4f} (Base: {base_thresholds[i]:.4f}, Adj.Factor: {adjustment_factors[i]:.4f})")
-    
-    # -------- Closed-set and Open-set Evaluation --------
     model.eval()
-    y_true_all, all_features_test = [], []
+    y_true_all = []
+    y_pred_all = []    # N+1 类的直接预测结果
+    all_logits = []    # 保存原始输出用于计算 AUROC 和 强制闭集预测
+    
     with torch.no_grad():
         for X_batch, lengths, y_batch in tqdm(test_loader, desc="Evaluation"):
-            features = model(X_batch.to(device), lengths.to(device))
-            y_true_all.extend(y_batch.numpy())
-            all_features_test.append(features.cpu())
+            X_batch, lengths = X_batch.to(device), lengths.to(device)
             
+            logits = model(X_batch, lengths)
+            preds = torch.argmax(logits, dim=1)
+            
+            all_logits.append(logits.cpu()) # 转移到CPU保存
+            y_true_all.extend(y_batch.numpy())
+            y_pred_all.extend(preds.cpu().numpy())
+            total_infer_samples_processed += len(y_batch) # 累加测试集样本数
+            
+    
+    # --- 结束推理计时 ---
+    infer_end_time = time.perf_counter()
+    total_infer_duration = infer_end_time - infer_start_time
+    avg_infer_time_per_sample = total_infer_duration / max(1, total_infer_samples_processed)
+
+    # 转换为 Tensor/Array 处理
     y_true_all = np.array(y_true_all)
-    all_features_test = torch.cat(all_features_test)
-
-    # Load resources required for evaluation
-    global_prototypes_eval = torch.load(PROTOTYPES_PATH)
-    thresholds_eval = torch.load(THRESHOLDS_PATH)
+    y_pred_all = np.array(y_pred_all)
+    all_logits = torch.cat(all_logits, dim=0) # Shape: [N_samples, num_classes + 1]
     
-    # -- Closed-set Evaluation --
-    dists_closed = torch.cdist(all_features_test, global_prototypes_eval)
-    y_pred_closed_all = torch.argmin(dists_closed, dim=1).numpy()
+    # 获取 Softmax 概率 (用于 AUROC)
+    all_probs = torch.softmax(all_logits, dim=1).numpy()
     
-    known_mask_eval = y_true_all >= 0
-    y_true_closed, y_pred_closed = y_true_all[known_mask_eval], y_pred_closed_all[known_mask_eval]
-    if len(y_true_closed) > 0:
-        acc = accuracy_score(y_true_closed, y_pred_closed)
-        pre = precision_score(y_true_closed, y_pred_closed, average="macro", zero_division=0)
-        rec = recall_score(y_true_closed, y_pred_closed, average="macro", zero_division=0)
-        f1  = f1_score(y_true_closed, y_pred_closed, average="macro", zero_division=0)
-        print(f"\nClosed-set Results -> Acc: {acc:.4f}, Prec: {pre:.4f}, Recall: {rec:.4f}, F1: {f1:.4f}")
-
-    # --- Open-set Classification using Dynamic Thresholds ---
-    print("\nPerforming open-set classification with DYNAMIC thresholds...")
-    # 1. Find the nearest class and the corresponding minimum distance for each sample
-    min_dists, preds_potential = torch.min(dists_closed, dim=1)
+    # ==========================================
+    # 1. 封闭集性能分析 (Closed-Set Performance)
+    # ==========================================
+    print("\n" + "="*40)
+    print(" 1. Closed-Set Performance (Known Samples Only)")
+    print("="*40)
     
-    # 2. Get the dynamic threshold for each potentially predicted class
-    class_specific_thresholds = thresholds_eval[preds_potential]
+    # 筛选掩码：真实标签不是未知类的样本
+    known_mask = y_true_all != num_known_classes
     
-    # 3. Check if the minimum distance exceeds the class-specific dynamic threshold
-    is_unknown = min_dists > class_specific_thresholds
-    
-    # 4. Generate final predictions
-    preds_open = preds_potential.numpy()
-    preds_open[is_unknown.numpy()] = -1 # Samples exceeding their threshold are classified as unknown (-1)
-
-    # --- Evaluation Report ---
-    unique_labels = sorted(set(y_true_all.tolist()) | set(preds_open.tolist()))
-    target_names = [le.inverse_transform([l])[0] if l != -1 else "Unknown" for l in unique_labels]
-    
-    print("\nOpen-set Evaluation Results (including unknown class = -1)")
-    print(classification_report(y_true_all, preds_open, labels=unique_labels, target_names=target_names, zero_division=0))
-    print("Confusion matrix:"); print(confusion_matrix(y_true_all, preds_open, labels=unique_labels))
-    
-    acc = accuracy_score(y_true_all, preds_open)
-    pre = precision_score(y_true_all, preds_open, average="macro", zero_division=0)
-    rec = recall_score(y_true_all, preds_open, average="macro", zero_division=0)
-    f1  = f1_score(y_true_all, preds_open, average="macro", zero_division=0)
-    print(f"\nOpen-set Overall -> Acc: {acc:.4f}, Prec: {pre:.4f}, Recall: {rec:.4f}, F1: {f1:.4f}")
-    
-    y_true_binary = (y_true_all != -1).astype(int); y_pred_binary = (preds_open != -1).astype(int)
-    if len(np.unique(y_pred_binary)) > 1:
-        # Handle cases where confusion matrix might not be 2x2
-        cm = confusion_matrix(y_true_binary, y_pred_binary, labels=[0, 1])
-        tn, fp, fn, tp = cm.ravel()
-        TPR = tp / (tp + fn) if (tp + fn) > 0 else 0 # Recall for known classes
-        FPR = fp / (fp + tn) if (fp + tn) > 0 else 0 # False positive rate for unknown classes
-        print(f"\nTPR (Known Class Recognition Rate): {TPR:.4f}"); print(f"FPR (Unknown Class Misclassification Rate): {FPR:.4f}")
+    if np.sum(known_mask) > 0:
+        y_true_closed = y_true_all[known_mask]
+        
+        # 获取这些样本对应的 Logits
+        logits_closed = all_logits[known_mask]
+        
+        # 核心：切片操作 logits_closed[:, :num_known_classes]
+        # 含义：强制模型在已知类别中选一个概率最大的，完全忽略“未知”选项
+        preds_closed_forced = torch.argmax(logits_closed[:, :num_known_classes], dim=1).numpy()
+        
+        acc_closed = accuracy_score(y_true_closed, preds_closed_forced)
+        pre_closed = precision_score(y_true_closed, preds_closed_forced, average="macro", zero_division=0)
+        rec_closed = recall_score(y_true_closed, preds_closed_forced, average="macro", zero_division=0)
+        f1_closed  = f1_score(y_true_closed, preds_closed_forced, average="macro", zero_division=0)
+        
+        print(f"Test Samples (Known): {len(y_true_closed)}")
+        print(f"Accuracy  : {acc_closed:.4f}")
+        print(f"Precision : {pre_closed:.4f} (Macro)")
+        print(f"Recall    : {rec_closed:.4f} (Macro)")
+        print(f"F1 Score  : {f1_closed:.4f} (Macro)")
     else:
-        print("\nCannot calculate TPR/FPR because predictions only contain one class.")
+        print("No known samples in test set! Skipping closed-set evaluation.")
+        
+        
+    # f1_closed = per_label_f1_dict(
+    #     y_true_closed,
+    #     preds_closed_forced,
+    #     zero_division=0
+    # )
     
-    return model
+    # print(f1_closed)
+
+
+    # ==========================================
+    # 2. 开放集性能指标 (Open-Set Performance)
+    # ==========================================
+    print("\n" + "="*50)
+    print(" 2. Open-Set Overall Performance (Macro Avg of N+1 classes)")
+    print("="*50)
+    
+    # --- A. 整体多分类指标 (N+1 Classes) ---
+    # 定义：对 N+1 个类别计算 Accuracy, Precision, Recall, F1
+    # 这里的 Accuracy 就是通常所说的 OS-ACC
+    
+    os_acc = accuracy_score(y_true_all, y_pred_all)
+    os_pre = precision_score(y_true_all, y_pred_all, average='macro', zero_division=0)
+    os_rec = recall_score(y_true_all, y_pred_all, average='macro', zero_division=0)
+    os_f1  = f1_score(y_true_all, y_pred_all, average='macro', zero_division=0)
+    
+    print(f"OS-Accuracy  : {os_acc:.4f}")
+    print(f"OS-Precision : {os_pre:.4f} (Macro)")
+    print(f"OS-Recall    : {os_rec:.4f} (Macro)")
+    print(f"OS-F1        : {os_f1:.4f}  (Macro)")
+
+    # --- B. AUROC and TPR@FPR95 (排序与拒识能力) ---
+    # 构建二分类标签 (0: Known, 1: Unknown)
+    y_true_binary = (y_true_all == num_known_classes).astype(int)
+    # 获取 Softmax 输出中“未知类”那一列的概率
+    y_score_unknown = all_probs[:, num_known_classes]
+    
+    try:
+        # Calculate AUROC
+        auroc = roc_auc_score(y_true_binary, y_score_unknown)
+        
+        # Calculate ROC Curve
+        fpr, tpr, thresholds = roc_curve(y_true_binary, y_score_unknown)
+        
+        # Find the max TPR where FPR <= 0.05 (TPR@FPR=5%)
+        # This tells us how many unknowns we catch while allowing a 5% false alarm rate on knowns.
+        valid_idx = np.where(fpr <= 0.05)[0]
+        tpr_at_fpr95 = tpr[valid_idx[-1]] if len(valid_idx) > 0 else 0.0
+        
+        print(f"OS-AUROC     : {auroc:.4f} (Known vs Unknown)")
+        print(f"TPR@FPR95    : {tpr_at_fpr95:.4f}")
+    except ValueError:
+        print("OS-AUROC     : Error (Likely only one class present in test set)")
+        print("TPR@FPR95    : Error")
+        
+
+    # ==========================================
+    # 3. 未知类检测详解 (Binary: Known vs Unknown)
+    # ==========================================
+    print("\n" + "="*50)
+    print(" 3. Unknown Detection Performance (Binary: Known=0, Unknown=1)")
+    print("="*50)
+    
+    # 将预测结果二值化：如果预测是 0~N-1 -> 0 (Known); 如果预测是 N -> 1 (Unknown)
+    y_pred_binary = (y_pred_all == num_known_classes).astype(int)
+    
+    # 计算二分类指标
+    bin_acc = accuracy_score(y_true_binary, y_pred_binary)
+    bin_pre = precision_score(y_true_binary, y_pred_binary, pos_label=1, zero_division=0)
+    bin_rec = recall_score(y_true_binary, y_pred_binary, pos_label=1, zero_division=0)
+    bin_f1  = f1_score(y_true_binary, y_pred_binary, pos_label=1, zero_division=0)
+    
+    print(f"Detection Accuracy  : {bin_acc:.4f}")
+    print(f"Detection Precision : {bin_pre:.4f} (Precision of Unknown)")
+    print(f"Detection Recall    : {bin_rec:.4f} (Recall of Unknown / TPR)")
+    print(f"Detection F1        : {bin_f1:.4f}")
+
+    # 混淆矩阵
+    cm = confusion_matrix(y_true_binary, y_pred_binary, labels=[0, 1])
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+        print("\nConfusion Matrix:")
+        print(f"                 Pred Known (0)   Pred Unknown (1)")
+        print(f"True Known (0)   {tn:<14}   {fp:<14} (FPR: {fp/(fp+tn):.4f})")
+        print(f"True Unknown (1) {fn:<14}   {tp:<14} (TPR: {tp/(tp+fn):.4f})")
+    
+    # 打印完整的分类报告供参考
+    target_names = list(le.classes_) + ["Unknown"]
+    unique_labels = sorted(list(set(y_true_all) | set(y_pred_all)))
+    valid_names = [target_names[i] for i in unique_labels]
+    
+    print("\n--- Detailed Classification Report ---")
+    print(classification_report(y_true_all, y_pred_all, labels=unique_labels, target_names=valid_names, zero_division=0))
+    
+    
+    # ==========================================
+    # --- 新增：耗时统计输出 ---
+    # ==========================================
+    print("\n" + "=" * 50)
+    print(" 4. Latency Analysis (Time Profiling)")
+    print("=" * 50)
+    print(f"Total Training Time       : {total_train_duration:.2f} s (Processed {total_train_samples_processed} sample passes across {EPOCHS} epochs)")
+    print(f"Avg Train Time per Sample : {avg_train_time_per_sample * 1000:.4f} ms")
+    print(f"Total Inference Time      : {total_infer_duration:.2f} s (Processed {total_infer_samples_processed} samples)")
+    print(f"Avg Infer Time per Sample : {avg_infer_time_per_sample * 1000:.4f} ms")
+    
+
 
 # =========================
-# 6. Visualization Function
-# =========================
-def visualize_feature_space(model, train_loader, test_loader, le, device, save_dir):
-    print("\n--- Feature Space Visualization ---")
-    train_features, train_labels = extract_features_global(model, train_loader, device)
-    test_features, test_labels = extract_features_global(model, test_loader, device)
-    
-    train_features = train_features.numpy()
-    train_labels = train_labels.numpy()
-    test_features = test_features.numpy()
-    test_labels = test_labels.numpy()
-
-    if TSNE_MAX_SAMPLES is not None and train_features.shape[0] > TSNE_MAX_SAMPLES:
-        print(f"Sampling training data from {train_features.shape[0]} down to {TSNE_MAX_SAMPLES} points...")
-        indices = np.random.choice(train_features.shape[0], TSNE_MAX_SAMPLES, replace=False)
-        train_features = train_features[indices]
-        train_labels = train_labels[indices]
-
-    if TSNE_MAX_SAMPLES is not None and test_features.shape[0] > TSNE_MAX_SAMPLES:
-        print(f"Sampling test data from {test_features.shape[0]} down to {TSNE_MAX_SAMPLES} points...")
-        indices = np.random.choice(test_features.shape[0], TSNE_MAX_SAMPLES, replace=False)
-        test_features = test_features[indices]
-        test_labels = test_labels[indices]
-    
-    all_features = np.vstack([train_features, test_features])
-    all_labels = np.concatenate([train_labels, test_labels])
-    source_labels = np.array(['train'] * len(train_labels) + ['test'] * len(test_labels))
-    
-    print(f"Running t-SNE on {all_features.shape[0]} samples...")
-    tsne = TSNE(n_components=2, perplexity=TSNE_PERPLEXITY, n_iter=1000, random_state=42, verbose=1)
-    tsne_results = tsne.fit_transform(all_features)
-    
-    print("Plotting results...")
-    plt.style.use('seaborn-v0_8-whitegrid')
-    fig, ax = plt.subplots(figsize=(18, 14))
-    
-    unique_labels = np.unique(all_labels)
-    known_labels = sorted([l for l in unique_labels if l != -1])
-    
-    colors = plt.cm.get_cmap('tab20', len(known_labels))
-    color_map = {label: colors(i) for i, label in enumerate(known_labels)}
-    color_map[-1] = '#808080'
-
-    for label in unique_labels:
-        label_text = f'Class {le.inverse_transform([label])[0]}' if label != -1 else 'Unknown'
-        train_mask = (all_labels == label) & (source_labels == 'train')
-        if np.any(train_mask):
-            ax.scatter(tsne_results[train_mask, 0], tsne_results[train_mask, 1],
-                       c=[color_map[label]], marker='o', s=25, alpha=0.5,
-                       label=f'Train: {label_text}')
-        test_mask = (all_labels == label) & (source_labels == 'test')
-        if np.any(test_mask):
-            ax.scatter(tsne_results[test_mask, 0], tsne_results[test_mask, 1],
-                       c=[color_map[label]], marker='x', s=60, alpha=0.9,
-                       label=f'Test: {label_text}')
-
-    ax.set_title(f't-SNE Visualization (Perplexity={TSNE_PERPLEXITY})', fontsize=20)
-    handles, labels = ax.get_legend_handles_labels()
-    unique_legend = dict(zip(labels, handles))
-    ax.legend(unique_legend.values(), unique_legend.keys(), bbox_to_anchor=(1.03, 1), loc='upper left', fontsize=10)
-    
-    plt.tight_layout(rect=[0, 0, 0.85, 1])
-    output_path = os.path.join(save_dir, "tsne_visualization_dynamic_threshold.png")
-    plt.savefig(output_path, dpi=300)
-    print(f"\nDone! Visualization saved to: {output_path}")
-
-# =========================
-# 7. Main Workflow
+# 5. Main Workflow
 # =========================
 def main():
-    # Check if data files exist
-    if not os.path.exists(TRAIN_PKL) or not os.path.exists(TEST_PKL):
-        print(f"Error: Please ensure training data '{TRAIN_PKL}' and test data '{TEST_PKL}' exist.")
-        print("You might need to modify the TRAIN_PKL and TEST_PKL variables at the top of the script.")
+    """
+    主函数，用于执行整个训练和评估流程
+    包括数据加载、预处理、模型训练和评估等步骤
+    """
+    # 1. 加载已知类别的训练数据
+    if not os.path.exists(TRAIN_PKL):
+        print(f"Error: {TRAIN_PKL} not found.")
         return
-
-    train_df, test_df = pd.read_pickle(TRAIN_PKL), pd.read_pickle(TEST_PKL)
+    train_df = pd.read_pickle(TRAIN_PKL)  # 从pickle文件加载训练数据
     
-    if os.path.exists(LABEL_ENCODER_PATH):
-        with open(LABEL_ENCODER_PATH, "rb") as f: le = pickle.load(f)
+    if TEST_PKL and os.path.exists(TEST_PKL):
+        test_df = pd.read_pickle(TEST_PKL)  # 如果存在测试集文件，则加载测试数据
     else:
-        le = LabelEncoder(); le.fit(train_df["label"].values)
-        with open(LABEL_ENCODER_PATH, "wb") as f: pickle.dump(le, f)
+        print('no test set.')
+        train_df, test_df = train_test_split(
+            train_df, test_size=0.1, random_state=42, stratify=train_df['label']
+        )
     
-    known_class = le.classes_
-    X_train = [log_normalize(f) for f in train_df["features"]]
-    X_test  = [log_normalize(f) for f in test_df["features"]]
+    # 2. 加载负样本数据 (未知类别)
+    if os.path.exists(NEGATIVE_TRAIN_PKL):
+        neg_df = pd.read_pickle(NEGATIVE_TRAIN_PKL)
+        print(f"Loaded Negative Data: {len(neg_df)} samples.")
 
-    train_loader = DataLoader(FlowDataset(X_train, train_df["label"].values, le, known_class), batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    test_loader  = DataLoader(FlowDataset(X_test, test_df["label"].values, le, known_class), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 强制设置负样本标签为 -1
+        neg_df["label"] = "unknown"
+
+        # 合并训练集
+        combined_train_df = pd.concat([train_df, neg_df], ignore_index=True)
+    else:
+        print(f"Warning: Negative data {NEGATIVE_TRAIN_PKL} not found! Training only on known classes (Closed Set).")
+        combined_train_df = train_df
+
+    # 修复：增加对 WORLD_PKL 是否为空的判断
+    if WORLD_PKL and os.path.exists(WORLD_PKL):
+        world_df = pd.read_pickle(WORLD_PKL)
+        world_df["label"] = "unknown"  # 确保测试集的未知样本标签为 -1
+        combined_test_df = pd.concat([test_df, world_df], ignore_index=True)
+    else:
+        combined_test_df = test_df
+
+    print(f"Final Train Size: {len(combined_train_df)}")
+    print(f"Final Test Size:  {len(combined_test_df)}")
+
+    # 4. Fit Label Encoder (只针对已知类别)
+    # 🚨 修复：从更新后的 combined_train_df 中提取，防止之前的 train_df 变量已经失效或不包含负样本切分后的逻辑
+    valid_labels = combined_train_df[
+        combined_train_df["label"] != "unknown"
+    ]["label"].values
+
+    if os.path.exists(LABEL_ENCODER_PATH):
+        # 建议每次重新生成，防止pkl里的encoder和当前数据不一致
+        pass
+
+    le = LabelEncoder()
+    le.fit(valid_labels)
+    with open(LABEL_ENCODER_PATH, "wb") as f:
+        pickle.dump(le, f)
+
+    known_class_set = set(le.classes_)
+    print(f"Known Classes: {len(known_class_set)}")
+
+    # 5. Data Loaders
+    # Dataset 会自动把不在 known_class_set 里的(即 -1) 映射为 第 N 类
+    X_train = [log_normalize(f) for f in combined_train_df["features"]]
+    X_test = [log_normalize(f) for f in combined_test_df["features"]]
+
+    train_loader = DataLoader(
+        FlowDataset(X_train, combined_train_df["label"].values, le, known_class_set),
+        batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn
+    )
+
+    test_loader = DataLoader(
+        FlowDataset(X_test, combined_test_df["label"].values, le, known_class_set),
+        batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn
+    )
+
+    device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    trained_model = train_eval_model(train_loader, test_loader, num_classes=len(le.classes_), le=le, device=device)
-    visualize_feature_space(trained_model, train_loader, test_loader, le, device, SAVE_DIR)
-    
+    # 6. Train & Eval
+    train_eval_n_plus_1(train_loader, test_loader, num_known_classes=len(known_class_set), le=le, device=device)
+
     print("\nAll tasks completed.")
+
+
+
 
 
 if __name__ == "__main__":
     main()
+    
+
