@@ -6,19 +6,6 @@ This repository provides the code and dataset of BFVS for encrypted traffic anal
 
 ![overview](overview.png)
 
-If you find this method helpful for your research, please cite our work:
-
-```latex
-@misc{xian2025udfs,
-      title={UDFS: Lightweight Representation-Driven Robust Network Traffic Classification}, 
-      author={Youquan Xian and Xueying Zeng and Mei Huang and Aoxiang Zhou and Xiaoyu Cui and Peng Liu and Lei Cui},
-      year={2025},
-      eprint={2509.11157},
-      archivePrefix={arXiv},
-      primaryClass={cs.NI},
-      url={https://arxiv.org/abs/2509.11157}, 
-}
-```
 
 -----
 
