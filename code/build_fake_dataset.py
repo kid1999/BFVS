@@ -3,6 +3,13 @@ import random
 import copy
 import numpy as np
 
+# fix random seed for reproducibility
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+
+set_seed(42)
+
 def signed_log_transform(chunk):
     """
     - 保留网络流的方向性 (正数为上行，负数为下行)
